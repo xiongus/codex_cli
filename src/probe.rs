@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -65,6 +65,20 @@ impl std::fmt::Display for ProbeFailure {
 
 impl std::error::Error for ProbeFailure {}
 
+#[derive(Debug, Clone)]
+struct ProbeRun {
+    account_result: Value,
+    limits_result: Option<Value>,
+    limits_error: Option<String>,
+    refreshed_auth: Value,
+}
+
+impl ProbeRun {
+    fn rate_limits_available(&self) -> bool {
+        self.limits_result.is_some()
+    }
+}
+
 pub fn run_probe(
     account_auth_path: &Path,
     timeout: Duration,
@@ -73,6 +87,34 @@ pub fn run_probe(
         kind: ProbeFailureKind::AuthFileRead,
         message: format!("read auth file failed: {err}"),
     })?;
+
+    let first = run_probe_once(&original_auth, timeout)?;
+    let final_run = if first.rate_limits_available() {
+        first
+    } else {
+        run_probe_once(&first.refreshed_auth, timeout).unwrap_or(first)
+    };
+
+    let refreshed_auth = final_run.refreshed_auth.clone();
+    let auth_meta = extract_meta(&refreshed_auth);
+    let snapshot = parse_snapshot(
+        final_run.account_result,
+        final_run.limits_result,
+        final_run.limits_error,
+        auth_meta,
+        timeout,
+    );
+
+    Ok(ProbeOutput {
+        refreshed_auth,
+        snapshot,
+    })
+}
+
+fn run_probe_once(
+    auth_value: &Value,
+    timeout: Duration,
+) -> std::result::Result<ProbeRun, ProbeFailure> {
     let tmp = TempDir::new()
         .context("create temp dir")
         .map_err(|err| ProbeFailure {
@@ -80,11 +122,9 @@ pub fn run_probe(
             message: format!("create temp dir failed: {err}"),
         })?;
     let temp_home = tmp.path();
-    atomic_write_json(&temp_home.join("auth.json"), &original_auth).map_err(|err| {
-        ProbeFailure {
-            kind: ProbeFailureKind::AuthFileRead,
-            message: format!("write temp auth file failed: {err}"),
-        }
+    atomic_write_json(&temp_home.join("auth.json"), auth_value).map_err(|err| ProbeFailure {
+        kind: ProbeFailureKind::AuthFileRead,
+        message: format!("write temp auth file failed: {err}"),
     })?;
 
     let mut child = Command::new(APP_SERVER_CMD[0])
@@ -109,48 +149,61 @@ pub fn run_probe(
             message: format!("write app-server request failed: {err}"),
         })?;
     }
-    drop(stdin);
 
     let stdout = child.stdout.take().ok_or_else(|| ProbeFailure {
         kind: ProbeFailureKind::AppServerSpawn,
         message: "capture stdout failed".to_string(),
     })?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let _ = tx.send(line);
-        }
-    });
+    let mut reader = BufReader::new(stdout);
+    let stdout_fd = reader.get_ref().as_raw_fd();
 
     let started = Instant::now();
-    let mut responses = std::collections::HashMap::<i64, Value>::new();
+    let mut responses = HashMap::<i64, Value>::new();
     while started.elapsed() < timeout {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(line)) => {
-                if let Ok(message) = serde_json::from_str::<Value>(&line)
-                    && let Some(id) = message.get("id").and_then(Value::as_i64)
-                {
-                    responses.insert(id, message);
-                    if responses.contains_key(&2) && responses.contains_key(&3) {
-                        break;
-                    }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let wait_ms = remaining.as_millis().min(500) as i32;
+        let mut pollfd = libc::pollfd {
+            fd: stdout_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, wait_ms) };
+        if rc < 0 {
+            return Err(ProbeFailure {
+                kind: ProbeFailureKind::AppServerExit,
+                message: format!(
+                    "poll codex app-server stdout failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+
+        if rc > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).map_err(|err| ProbeFailure {
+                kind: ProbeFailureKind::AppServerExit,
+                message: format!("read app-server stdout failed: {err}"),
+            })?;
+            if bytes == 0 {
+                break;
+            }
+            if let Ok(message) = serde_json::from_str::<Value>(line.trim())
+                && let Some(id) = message.get("id").and_then(Value::as_i64)
+            {
+                responses.insert(id, message);
+                if responses.contains_key(&2) && responses.contains_key(&3) {
+                    break;
                 }
             }
-            Ok(Err(_)) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(status) = child.try_wait().map_err(|err| ProbeFailure {
-                    kind: ProbeFailureKind::AppServerExit,
-                    message: format!("poll codex app-server failed: {err}"),
-                })? && !status.success()
-                {
-                    return Err(ProbeFailure {
-                        kind: ProbeFailureKind::AppServerExit,
-                        message: format!("codex app-server exited with {status}"),
-                    });
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        } else if let Some(status) = child.try_wait().map_err(|err| ProbeFailure {
+            kind: ProbeFailureKind::AppServerExit,
+            message: format!("poll codex app-server failed: {err}"),
+        })? && !status.success()
+        {
+            return Err(ProbeFailure {
+                kind: ProbeFailureKind::AppServerExit,
+                message: format!("codex app-server exited with {status}"),
+            });
         }
     }
 
@@ -174,22 +227,23 @@ pub fn run_probe(
             kind: ProbeFailureKind::AccountReadTimeout,
             message: format!("account/read did not return within {:?}", timeout),
         })?;
-    let limits_result = responses
-        .get(&3)
-        .and_then(|value| value.get("result"))
-        .cloned();
 
-    let refreshed_auth = load_auth(&temp_home.join("auth.json"))
-        .map_err(|err| ProbeFailure {
-            kind: ProbeFailureKind::AuthFileRead,
-            message: format!("read refreshed auth failed: {err}"),
-        })
-        .unwrap_or(original_auth);
-    let auth_meta = extract_meta(&refreshed_auth);
-    let snapshot = parse_snapshot(account_result, limits_result, auth_meta, timeout);
-    Ok(ProbeOutput {
+    let id3 = responses.get(&3);
+    let limits_result = id3.and_then(|value| value.get("result")).cloned();
+    let limits_error = id3
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let refreshed_auth =
+        load_auth(&temp_home.join("auth.json")).unwrap_or_else(|_| auth_value.clone());
+
+    Ok(ProbeRun {
+        account_result,
+        limits_result,
+        limits_error,
         refreshed_auth,
-        snapshot,
     })
 }
 
@@ -225,6 +279,7 @@ fn build_probe_messages() -> Vec<String> {
 fn parse_snapshot(
     account_result: Value,
     limits_result: Option<Value>,
+    limits_error: Option<String>,
     account_meta: AuthMeta,
     timeout: Duration,
 ) -> ProbeSnapshot {
@@ -235,10 +290,12 @@ fn parse_snapshot(
     let mut warnings = Vec::new();
     let rate_limits_available = limits_result.is_some();
     if !rate_limits_available {
-        warnings.push(format!(
-            "account/rateLimits/read did not return within {:?}",
-            timeout
-        ));
+        warnings.push(limits_error.unwrap_or_else(|| {
+            format!(
+                "account/rateLimits/read did not return within {:?}",
+                timeout
+            )
+        }));
     }
     let snapshot = limits_result
         .as_ref()
