@@ -10,4 +10,4 @@ else
   echo "No installed binary found at ${TARGET_BIN}"
 fi
 
-echo "Account data in ~/.codex/account-pool was left untouched."
+echo "Managed account data in ~/.codex/account-pool-rs was left untouched."

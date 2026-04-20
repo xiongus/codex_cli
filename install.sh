@@ -5,8 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${HOME}/.local/bin"
 TARGET_BIN="${TARGET_DIR}/codex-pool"
 
+cd "${SCRIPT_DIR}"
+cargo build --release
+
 mkdir -p "${TARGET_DIR}"
-install -m 0755 "${SCRIPT_DIR}/codex_cli.py" "${TARGET_BIN}"
+install -m 0755 "${SCRIPT_DIR}/target/release/codex-pool" "${TARGET_BIN}"
 
 cat <<EOF
 Installed codex-pool -> ${TARGET_BIN}
